@@ -3,6 +3,20 @@
 NGROK_PID_FILE="/tmp/ngrok-1234.pid"
 NGROK_LOG="/tmp/ngrok-1234.log"
 
+# Function to check if Cursor is running
+check_cursor_running() {
+    # Check for actual Cursor IDE process (not just any process with "cursor" in name)
+    # Look for the main Cursor executable or processes in Cursor directory
+    if pgrep -f "/usr/share/cursor/cursor" > /dev/null 2>&1 || \
+       pgrep -f "/opt/cursor/cursor" > /dev/null 2>&1 || \
+       pgrep -x "Cursor" > /dev/null 2>&1 || \
+       pgrep -x "cursor" > /dev/null 2>&1; then
+        return 0  # Cursor is running
+    else
+        return 1  # Cursor is not running
+    fi
+}
+
 # Check if ngrok is installed
 if ! command -v ngrok &> /dev/null; then
     echo "❌ Error: ngrok is not installed"
@@ -113,6 +127,331 @@ if [ "$1" == "status" ]; then
     exit 0
 fi
 
+# Function to update Cursor API key
+update_cursor_api_key() {
+    local api_key="$1"
+    
+    if [ -z "$api_key" ]; then
+        echo "❌ Error: API key is required"
+        echo "Usage: $0 update-cursor-api-key <api-key>"
+        return 1
+    fi
+    
+    local db_path="$HOME/.config/Cursor/User/globalStorage/state.vscdb"
+    
+    if [ ! -f "$db_path" ]; then
+        echo "❌ Error: Cursor database not found at $db_path"
+        return 1
+    fi
+    
+    # Check if sqlite3 is available
+    if ! command -v sqlite3 &> /dev/null; then
+        echo "❌ Error: sqlite3 is not installed"
+        echo "   Install it with: sudo apt install sqlite3"
+        return 1
+    fi
+    
+    # Check if Cursor is running - must be closed for UI to update properly
+    if check_cursor_running; then
+        echo "❌ Error: Cursor IDE is currently running"
+        echo ""
+        echo "   Cursor must be closed before updating database values."
+        echo "   The UI will not reflect changes if Cursor is running."
+        echo ""
+        echo "   Please close Cursor IDE and run this command again."
+        return 1
+    fi
+    
+    echo "Updating Cursor API key..."
+    echo "  API Key: $api_key"
+    echo ""
+    
+    # Use Python for proper error handling and locking
+    python3 << PYTHON_EOF
+import sqlite3
+import sys
+import os
+import time
+
+db_path = os.path.expanduser("$db_path")
+api_key = "$api_key"
+max_retries = 3
+retry_delay = 0.5
+
+for attempt in range(max_retries):
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        cursor = conn.cursor()
+        
+        # Use BEGIN IMMEDIATE to get a write lock
+        cursor.execute("BEGIN IMMEDIATE")
+        
+        # Update API Key
+        cursor.execute("UPDATE ItemTable SET value = ? WHERE key = 'cursorAuth/openAIKey'", (api_key,))
+        if cursor.rowcount > 0:
+            print("✓ Updated API Key")
+        else:
+            # Insert if doesn't exist
+            cursor.execute("INSERT INTO ItemTable (key, value) VALUES ('cursorAuth/openAIKey', ?)", (api_key,))
+            print("✓ Inserted API Key")
+        
+        conn.commit()
+        conn.close()
+        print("")
+        print("✓ Cursor API key updated successfully!")
+        print("  You may need to restart Cursor for changes to take effect.")
+        sys.exit(0)
+        
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+            print(f"⚠️  Database locked, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
+            time.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff
+            continue
+        else:
+            print(f"❌ Error updating database: {e}", file=sys.stderr)
+            print("   Try closing Cursor IDE and running the command again.", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error updating database: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+
+print("❌ Failed to update after {max_retries} attempts", file=sys.stderr)
+sys.exit(1)
+PYTHON_EOF
+
+    return $?
+}
+
+# Function to update Cursor base URL
+update_cursor_base_url() {
+    local url="$1"
+    
+    if [ -z "$url" ]; then
+        # Try to get current ngrok URL if not provided
+        if [ -f "$NGROK_PID_FILE" ]; then
+            pid=$(cat "$NGROK_PID_FILE")
+            if ps -p "$pid" > /dev/null 2>&1; then
+                url=$(get_ngrok_url 0)
+            fi
+        fi
+        
+        if [ -z "$url" ]; then
+            pid=$(pgrep -f "ngrok http 1234")
+            if [ -n "$pid" ]; then
+                url=$(get_ngrok_url 0)
+            fi
+        fi
+        
+        if [ -z "$url" ]; then
+            echo "❌ Error: URL is required"
+            echo "Usage: $0 update-cursor-base-url <url>"
+            echo "   Or run this command while ngrok is running to use current URL"
+            return 1
+        fi
+    fi
+    
+    local cursor_url="${url%/v1}"  # Remove /v1 if present, we'll add it
+    cursor_url="${cursor_url}/v1"
+    local db_path="$HOME/.config/Cursor/User/globalStorage/state.vscdb"
+    
+    if [ ! -f "$db_path" ]; then
+        echo "❌ Error: Cursor database not found at $db_path"
+        return 1
+    fi
+    
+    # Check if Python 3 is available (needed for JSON manipulation)
+    if ! command -v python3 &> /dev/null; then
+        echo "❌ Error: python3 is not installed"
+        echo "   Install it with: sudo apt install python3"
+        return 1
+    fi
+    
+    # Check if Cursor is running - must be closed for UI to update properly
+    if check_cursor_running; then
+        echo "❌ Error: Cursor IDE is currently running"
+        echo ""
+        echo "   Cursor must be closed before updating database values."
+        echo "   The UI will not reflect changes if Cursor is running."
+        echo ""
+        echo "   Please close Cursor IDE and run this command again."
+        return 1
+    fi
+    
+    echo "Updating Cursor base URL..."
+    echo "  Base URL: $cursor_url"
+    echo ""
+    
+    # Create Python script to update the database
+    python3 << PYTHON_EOF
+import sqlite3
+import json
+import sys
+import os
+import time
+
+db_path = os.path.expanduser("$db_path")
+cursor_url = "$cursor_url"
+max_retries = 3
+retry_delay = 0.5
+
+for attempt in range(max_retries):
+    try:
+        conn = sqlite3.connect(db_path, timeout=5.0)
+        cursor = conn.cursor()
+        
+        # Use BEGIN IMMEDIATE to get a write lock
+        cursor.execute("BEGIN IMMEDIATE")
+        
+        # Update Base URL
+        storage_key = 'src.vs.platform.reactivestorage.browser.reactiveStorageServiceImpl.persistentStorage.applicationUser'
+        cursor.execute("SELECT value FROM ItemTable WHERE key = ?", (storage_key,))
+        row = cursor.fetchone()
+        
+        if row:
+            data = json.loads(row[0])
+            old_url = data.get("openAIBaseUrl", "Not set")
+            data["openAIBaseUrl"] = cursor_url
+            updated_json = json.dumps(data)
+            cursor.execute("UPDATE ItemTable SET value = ? WHERE key = ?", (updated_json, storage_key))
+            print(f"✓ Updated Base URL")
+            print(f"  Old: {old_url}")
+            print(f"  New: {cursor_url}")
+        else:
+            print("⚠️  Base URL storage key not found - creating new entry...")
+            # Create minimal structure if it doesn't exist
+            new_data = {"openAIBaseUrl": cursor_url}
+            cursor.execute("INSERT INTO ItemTable (key, value) VALUES (?, ?)", 
+                          (storage_key, json.dumps(new_data)))
+            print("✓ Created Base URL entry")
+        
+        conn.commit()
+        conn.close()
+        print("")
+        print("✓ Cursor base URL updated successfully!")
+        print("  You may need to restart Cursor for changes to take effect.")
+        sys.exit(0)
+        
+    except sqlite3.OperationalError as e:
+        if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+            print(f"⚠️  Database locked, retrying in {retry_delay}s... (attempt {attempt + 1}/{max_retries})")
+            time.sleep(retry_delay)
+            retry_delay *= 2  # Exponential backoff
+            continue
+        else:
+            print(f"❌ Error updating database: {e}", file=sys.stderr)
+            print("   Try closing Cursor IDE and running the command again.", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error updating database: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+
+print(f"❌ Failed to update after {max_retries} attempts", file=sys.stderr)
+sys.exit(1)
+PYTHON_EOF
+
+    return $?
+}
+
+# Function to update both Cursor API key and base URL
+update_cursor() {
+    local api_key="${1:-lm-studio}"  # Default to "lm-studio" if not provided
+    local url="$2"
+    
+    # Check if Cursor is running - must be closed for UI to update properly
+    if check_cursor_running; then
+        echo "❌ Error: Cursor IDE is currently running"
+        echo ""
+        echo "   Cursor must be closed before updating database values."
+        echo "   The UI will not reflect changes if Cursor is running."
+        echo ""
+        echo "   Please close Cursor IDE and run this command again."
+        return 1
+    fi
+    
+    # Get ngrok URL if not provided
+    if [ -z "$url" ]; then
+        echo "No URL provided, attempting to retrieve from running ngrok tunnel..."
+        if [ -f "$NGROK_PID_FILE" ]; then
+            pid=$(cat "$NGROK_PID_FILE")
+            if ps -p "$pid" > /dev/null 2>&1; then
+                url=$(get_ngrok_url 0)
+            fi
+        fi
+        
+        if [ -z "$url" ]; then
+            pid=$(pgrep -f "ngrok http 1234")
+            if [ -n "$pid" ]; then
+                url=$(get_ngrok_url 0)
+            fi
+        fi
+        
+        if [ -z "$url" ]; then
+            echo "❌ Error: Could not retrieve ngrok URL. Is ngrok running?"
+            echo "   Start ngrok first: $0"
+            echo "   Or provide URL manually: $0 update-cursor <api-key> <url>"
+            return 1
+        fi
+        echo "  Using ngrok URL: $url"
+    fi
+    
+    echo ""
+    echo "Updating Cursor settings..."
+    echo "  API Key: $api_key"
+    echo "  Base URL: ${url}/v1"
+    echo ""
+    
+    # Update API key
+    if ! update_cursor_api_key "$api_key"; then
+        echo "❌ Failed to update API key"
+        return 1
+    fi
+    
+    echo ""
+    
+    # Update base URL
+    if ! update_cursor_base_url "$url"; then
+        echo "❌ Failed to update base URL"
+        return 1
+    fi
+    
+    echo ""
+    echo "✓ Cursor settings updated successfully!"
+    echo "  API Key: $api_key"
+    echo "  Base URL: ${url}/v1"
+    echo ""
+    echo "  Please restart Cursor IDE for changes to take effect."
+    
+    return 0
+}
+
+# Handle update-cursor command (convenience command to update both)
+if [ "$1" == "update-cursor" ]; then
+    update_cursor "$2" "$3"
+    exit $?
+fi
+
+# Handle update-cursor-api-key command
+if [ "$1" == "update-cursor-api-key" ]; then
+    if [ -z "$2" ]; then
+        echo "❌ Error: API key is required"
+        echo "Usage: $0 update-cursor-api-key <api-key>"
+        exit 1
+    fi
+    update_cursor_api_key "$2"
+    exit $?
+fi
+
+# Handle update-cursor-base-url command
+if [ "$1" == "update-cursor-base-url" ]; then
+    update_cursor_base_url "$2"
+    exit $?
+fi
+
 # Handle copy command
 if [ "$1" == "copy" ]; then
     # Check if ngrok is running
@@ -219,9 +558,12 @@ if [ -n "$NGROK_URL" ]; then
     echo "Inspect requests: http://127.0.0.1:4040/inspect/http"
     echo ""
     echo "Commands:"
-    echo "  $0 status  - Show status and URL"
-    echo "  $0 stop    - Stop ngrok"
-    echo "  $0 copy    - Copy Cursor API URL to clipboard"
+    echo "  $0 status                - Show status and URL"
+    echo "  $0 stop                  - Stop ngrok"
+    echo "  $0 copy                  - Copy Cursor API URL to clipboard"
+    echo "  $0 update-cursor [key] [url]  - Update both API key and base URL (defaults: lm-studio, current ngrok URL)"
+    echo "  $0 update-cursor-api-key <key>  - Update Cursor API key in database"
+    echo "  $0 update-cursor-base-url [url]  - Update Cursor base URL (uses current ngrok URL if not specified)"
 else
     echo "⚠ Could not retrieve ngrok URL"
     echo "Check if ngrok is running: $0 status"
