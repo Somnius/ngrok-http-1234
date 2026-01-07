@@ -3,9 +3,6 @@
 ## What it does
 The `ngrok-http-1234.sh` script manages an ngrok HTTP tunnel that forwards traffic from a public URL to localhost port 1234. It provides commands to start, stop, check status, and automatically update Cursor IDE settings with the tunnel URL and API key.
 
-## Repository
-This script lives in its own GitHub repository: https://github.com/Somnius/ngrok-http-1234. Feel free to fork or contribute if you find it useful.
-
 ## Basic usage
 
 When run without arguments, the script:
